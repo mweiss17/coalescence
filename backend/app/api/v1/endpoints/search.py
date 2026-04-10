@@ -54,7 +54,9 @@ async def search(
         pass
 
     results: list[dict] = []
+    seen_ids: set[str] = set()
 
+    # --- Semantic search ---
     if query_embedding:
         if search_type in ("all", "paper"):
             results.extend(await _vector_search_papers(
@@ -66,17 +68,32 @@ async def search(
                 db, query_embedding, domain, after_dt, before_dt, fetch_limit
             ))
 
-        results.sort(key=lambda r: r["score"], reverse=True)
+    # Index results by ID for dedup/score merging
+    def _rid(r: dict) -> str:
+        return str(r["paper"]["id"]) if r["type"] == "paper" else str(r["root_comment"]["id"])
 
-        if results:
-            return results[skip:skip + limit]
+    result_map: dict[str, dict] = {}
+    for r in results:
+        result_map[_rid(r)] = r
 
-    # --- Fallback: full-text search ---
+    # --- Always supplement with text search ---
+    text_results: list[dict] = []
     if search_type in ("all", "paper"):
-        results.extend(await _text_search_papers(db, q, domain, after_dt, before_dt, fetch_limit))
+        text_results.extend(await _text_search_papers(db, q, domain, after_dt, before_dt, fetch_limit))
 
     if search_type in ("all", "thread"):
-        results.extend(await _text_search_threads(db, q, domain, after_dt, before_dt, fetch_limit))
+        text_results.extend(await _text_search_threads(db, q, domain, after_dt, before_dt, fetch_limit))
+
+    # Merge: keep max score for duplicates, add new results
+    for r in text_results:
+        rid = _rid(r)
+        if rid in result_map:
+            if r["score"] > result_map[rid]["score"]:
+                result_map[rid]["score"] = r["score"]
+        else:
+            result_map[rid] = r
+
+    results = list(result_map.values())
 
     results.sort(key=lambda r: r["score"], reverse=True)
     return results[skip:skip + limit]
@@ -133,7 +150,7 @@ async def _vector_search_threads(
             score=round(1.0 - (row.distance / 2.0), 4),
             paper_id=row.Comment.paper_id,
             paper_title=row.Comment.paper.title if row.Comment.paper else "",
-            paper_domain=row.Comment.paper.domain if row.Comment.paper else "",
+            paper_domains=row.Comment.paper.domains if row.Comment.paper else [],
             root_comment=_comment_response(row.Comment),
         ).model_dump()
         for row in rows
@@ -145,81 +162,113 @@ async def _vector_search_threads(
 async def _text_search_papers(
     db: AsyncSession, q: str, domain, after_dt, before_dt, limit
 ) -> list[dict]:
-    # Try FTS first, then ILIKE
-    for use_fts in (True, False):
-        query = select(Paper).options(joinedload(Paper.submitter))
+    def _text_score(paper, base: float) -> float:
+        """Boost score if query appears in the title."""
+        if q.lower() in paper.title.lower():
+            return min(base + 0.5, 0.99)
+        return base
 
-        if use_fts:
-            query = query.where(
-                func.to_tsvector("english", Paper.title + " " + Paper.abstract).match(q)
+    # Try FTS first, fall back to ILIKE if FTS errors or returns nothing
+    try:
+        query = (
+            select(Paper)
+            .options(joinedload(Paper.submitter))
+            .where(
+                func.to_tsvector("english", Paper.title + " " + Paper.abstract).op("@@")(
+                    func.websearch_to_tsquery("english", q)
+                )
             )
-        else:
-            query = query.where(
-                or_(Paper.title.ilike(f"%{q}%"), Paper.abstract.ilike(f"%{q}%"))
-            )
-
+        )
         query = _apply_paper_filters(query, domain, after_dt, before_dt)
         query = query.limit(limit)
-
         result = await db.execute(query)
         papers = result.scalars().unique().all()
-
         if papers:
             return [
-                SearchResultPaper(
-                    score=0.5 if use_fts else 0.3,  # Lower score for text fallback
-                    paper=_paper_response(p),
-                ).model_dump()
+                SearchResultPaper(score=_text_score(p, 0.5), paper=_paper_response(p)).model_dump()
                 for p in papers
             ]
+    except Exception:
+        await db.rollback()
 
-    return []
+    # ILIKE fallback
+    query = (
+        select(Paper)
+        .options(joinedload(Paper.submitter))
+        .where(or_(Paper.title.ilike(f"%{q}%"), Paper.abstract.ilike(f"%{q}%")))
+    )
+    query = _apply_paper_filters(query, domain, after_dt, before_dt)
+    query = query.limit(limit)
+    result = await db.execute(query)
+    papers = result.scalars().unique().all()
+    return [
+        SearchResultPaper(score=_text_score(p, 0.3), paper=_paper_response(p)).model_dump()
+        for p in papers
+    ]
 
 
 async def _text_search_threads(
     db: AsyncSession, q: str, domain, after_dt, before_dt, limit
 ) -> list[dict]:
-    # Search comment content, then group by root thread
-    for use_fts in (True, False):
+    # Try FTS first, fall back to ILIKE if FTS errors or returns nothing
+    try:
         query = (
             select(Comment)
             .options(joinedload(Comment.author), joinedload(Comment.paper))
-            .where(Comment.parent_id.is_(None))  # Root comments only
-        )
-
-        if use_fts:
-            query = query.where(
-                func.to_tsvector("english", Comment.content_markdown).match(q)
+            .where(Comment.parent_id.is_(None))
+            .where(
+                func.to_tsvector("english", Comment.content_markdown).op("@@")(
+                    func.websearch_to_tsquery("english", q)
+                )
             )
-        else:
-            query = query.where(Comment.content_markdown.ilike(f"%{q}%"))
-
+        )
         query = _apply_thread_filters(query, domain, after_dt, before_dt)
         query = query.limit(limit)
-
         result = await db.execute(query)
         comments = result.scalars().unique().all()
-
         if comments:
             return [
                 SearchResultThread(
-                    score=0.5 if use_fts else 0.3,
+                    score=0.5,
                     paper_id=c.paper_id,
                     paper_title=c.paper.title if c.paper else "",
-                    paper_domain=c.paper.domain if c.paper else "",
+                    paper_domains=c.paper.domains if c.paper else [],
                     root_comment=_comment_response(c),
                 ).model_dump()
                 for c in comments
             ]
+    except Exception:
+        await db.rollback()
 
-    return []
+    # ILIKE fallback
+    query = (
+        select(Comment)
+        .options(joinedload(Comment.author), joinedload(Comment.paper))
+        .where(Comment.parent_id.is_(None))
+        .where(Comment.content_markdown.ilike(f"%{q}%"))
+    )
+    query = _apply_thread_filters(query, domain, after_dt, before_dt)
+    query = query.limit(limit)
+    result = await db.execute(query)
+    comments = result.scalars().unique().all()
+    return [
+        SearchResultThread(
+            score=0.3,
+            paper_id=c.paper_id,
+            paper_title=c.paper.title if c.paper else "",
+            paper_domains=c.paper.domains if c.paper else [],
+            root_comment=_comment_response(c),
+        ).model_dump()
+        for c in comments
+    ]
 
 
 # ---- Filter helpers ----
 
 def _apply_paper_filters(query, domain, after_dt, before_dt):
     if domain:
-        query = query.where(Paper.domain == domain)
+        d = domain if domain.startswith("d/") else f"d/{domain}"
+        query = query.where(Paper.domains.any(d))
     if after_dt:
         query = query.where(Paper.created_at >= after_dt)
     if before_dt:
@@ -229,7 +278,8 @@ def _apply_paper_filters(query, domain, after_dt, before_dt):
 
 def _apply_thread_filters(query, domain, after_dt, before_dt):
     if domain:
-        query = query.where(Comment.paper.has(Paper.domain == domain))
+        d = domain if domain.startswith("d/") else f"d/{domain}"
+        query = query.where(Comment.paper.has(Paper.domains.any(d)))
     if after_dt:
         query = query.where(Comment.created_at >= after_dt)
     if before_dt:
@@ -244,7 +294,7 @@ def _paper_response(paper: Paper) -> PaperResponse:
         id=paper.id,
         title=paper.title,
         abstract=paper.abstract,
-        domain=paper.domain,
+        domains=paper.domains,
         pdf_url=paper.pdf_url,
         github_repo_url=paper.github_repo_url,
         submitter_id=paper.submitter_id,

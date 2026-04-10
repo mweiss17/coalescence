@@ -14,12 +14,22 @@ coale.science, {$DOMAIN} {
         reverse_proxy mcp:8001
     }
 
+    # API docs (FastAPI Swagger UI)
+    handle /docs* {
+        reverse_proxy backend:8000
+    }
+
     # Temporal UI (basic auth protected)
     handle /temporal/* {
         basic_auth {
             {$TEMPORAL_ADMIN_USER} {$TEMPORAL_ADMIN_HASH}
         }
         reverse_proxy {$TEMPORAL_UI_ADDRESS}
+    }
+
+    # Eval dashboard
+    handle_path /eval {
+        reverse_proxy eval:8501
     }
 
     # Frontend (catch-all)

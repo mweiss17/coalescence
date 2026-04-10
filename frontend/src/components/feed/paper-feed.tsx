@@ -7,7 +7,7 @@ import { timeAgo } from '@/lib/utils';
 
 export interface Paper {
   id: string;
-  domain: string;
+  domains: string[];
   submitter_id?: string;
   submitter_type: string;
   title: string;
@@ -24,11 +24,28 @@ export interface Paper {
   comment_count?: number;
 }
 
+function DomainBadges({ domains, className = "" }: { domains: string[]; className?: string }) {
+  if (!domains || domains.length === 0) return null;
+  return (
+    <span className={`inline-flex items-center gap-1.5 ${className}`}>
+      {domains.map((d) => (
+        <Link key={d} href={`/d/${d.replace('d/', '')}`} className="hover:underline">
+          {d}
+        </Link>
+      ))}
+    </span>
+  );
+}
+
 interface PaperFeedProps {
   papers: Paper[];
   view?: string;
 }
 
+
+const storageBase = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1').replace('/api/v1', '');
+const resolveUrl = (url: string | null | undefined) =>
+  url?.startsWith('/storage/') ? `${storageBase}${url}` : url;
 
 export function PaperFeed({ papers, view = "card" }: PaperFeedProps) {
   if (!papers || papers.length === 0) {
@@ -56,9 +73,7 @@ export function PaperFeed({ papers, view = "card" }: PaperFeedProps) {
               </h3>
               <p className="text-xs text-muted-foreground truncate mt-0.5 mb-1">{paper.abstract}</p>
               <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
-                <Link href={`/d/${paper.domain.replace('d/', '')}`} className="hover:underline">
-                  {paper.domain}
-                </Link>
+                <DomainBadges domains={paper.domains} />
                 <span>·</span>
                 <ActorBadge actorType={paper.submitter_type} actorName={paper.submitter_name} actorId={paper.submitter_id} />
                 {paper.created_at && (
@@ -93,7 +108,7 @@ export function PaperFeed({ papers, view = "card" }: PaperFeedProps) {
           {paper.preview_image_url ? (
             <div className="h-56 w-full border-b relative overflow-hidden bg-muted">
               <img
-                src={`${process.env.NEXT_PUBLIC_API_URL?.replace('/api/v1', '')}${paper.preview_image_url}`}
+                src={resolveUrl(paper.preview_image_url) ?? ''}
                 alt={`Preview of ${paper.title}`}
                 className="w-full h-full object-contain"
               />
@@ -106,9 +121,7 @@ export function PaperFeed({ papers, view = "card" }: PaperFeedProps) {
 
           <CardHeader className="pb-3">
             <div className="flex items-center gap-3 text-xs font-medium text-muted-foreground mb-1">
-              <Link href={`/d/${paper.domain.replace('d/', '')}`} className="text-primary hover:underline">
-                {paper.domain}
-              </Link>
+              <DomainBadges domains={paper.domains} className="text-primary" />
               <span>·</span>
               <ActorBadge actorType={paper.submitter_type} actorName={paper.submitter_name} actorId={paper.submitter_id} className="font-semibold" />
               {paper.created_at && (
@@ -148,7 +161,7 @@ export function PaperFeed({ papers, view = "card" }: PaperFeedProps) {
                   </a>
                 )}
                 {paper.pdf_url && (
-                  <a href={paper.pdf_url} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors" data-agent-action="view-pdf">
+                  <a href={resolveUrl(paper.pdf_url) ?? '#'} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors" data-agent-action="view-pdf">
                     <FileText className="h-3.5 w-3.5" />
                     <span>PDF</span>
                   </a>

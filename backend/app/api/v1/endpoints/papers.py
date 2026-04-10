@@ -1,18 +1,23 @@
-import uuid
+import math
+import os
+from pathlib import Path
 from typing import List, Optional
-
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select, func
+from datetime import datetime, timezone
+import tempfile
+import uuid
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, status
+from sqlalchemy import select, func, case, text
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
-from app.core.deps import get_current_actor
+from app.core.deps import get_current_actor, get_current_actor_optional
 from app.core.rate_limit import limiter, PAPER_SUBMIT_RATE_LIMIT
 from app.models.identity import Actor
 from app.models.platform import Paper, PaperRevision, Domain, Comment
 from app.schemas.platform import (
     PaperCreate,
+    PaperUpdate,
     PaperResponse,
     PaperIngest,
     PaperRevisionCreate,
@@ -20,12 +25,17 @@ from app.schemas.platform import (
     WorkflowTriggerResponse,
 )
 from app.core.events import emit_event
-from app.core.pdf_preview import extract_preview_from_url
+from app.core.pdf_preview import extract_preview_from_url, extract_best_preview_bytes
+from app.core.storage import storage
 
 router = APIRouter()
 
 # Reddit Hot algorithm reference epoch (seconds)
 EPOCH = 1134028003
+
+
+def _normalize_domain(d: str) -> str:
+    return d if d.startswith("d/") else f"d/{d}"
 
 
 def _paper_to_response(
@@ -38,7 +48,7 @@ def _paper_to_response(
         id=paper.id,
         title=paper.title,
         abstract=paper.abstract,
-        domain=paper.domain,
+        domains=paper.domains,
         pdf_url=paper.pdf_url,
         github_repo_url=paper.github_repo_url,
         submitter_id=paper.submitter_id,
@@ -123,7 +133,8 @@ async def get_papers(
     query = select(Paper).options(joinedload(Paper.submitter))
 
     if domain:
-        query = query.where(Paper.domain == domain)
+        d = _normalize_domain(domain)
+        query = query.where(Paper.domains.any(d))
 
     if sort == "hot":
         # Reddit Hot algorithm: sign(score) * log10(max(|score|, 1)) + (epoch_seconds - reference) / 45000
@@ -174,19 +185,19 @@ async def get_papers(
 
 
 @router.post("/", response_model=PaperResponse, status_code=status.HTTP_201_CREATED)
-@limiter.limit(PAPER_SUBMIT_RATE_LIMIT)
 async def create_paper(
     request: Request,
     paper_in: PaperCreate,
     actor: Actor = Depends(get_current_actor),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new paper."""
+    """Create a new paper. Accepts comma-separated domains (e.g. 'NLP, Vision')."""
+    domains = paper_in.to_domains()
     preview_image_url = await _extract_preview(paper_in.pdf_url)
     paper = Paper(
         title=paper_in.title,
         abstract=paper_in.abstract,
-        domain=paper_in.domain,
+        domains=domains,
         pdf_url=paper_in.pdf_url,
         github_repo_url=paper_in.github_repo_url,
         submitter_id=actor.id,
@@ -209,9 +220,11 @@ async def create_paper(
         )
     )
 
-    # Resolve domain_id for event
-    domain_result = await db.execute(select(Domain).where(Domain.name == paper.domain))
-    domain_obj = domain_result.scalar_one_or_none()
+    # Resolve domain_id for event (use first domain)
+    domain_obj = None
+    if paper.domains:
+        domain_result = await db.execute(select(Domain).where(Domain.name == paper.domains[0]))
+        domain_obj = domain_result.scalar_one_or_none()
 
     await emit_event(
         db,
@@ -222,7 +235,7 @@ async def create_paper(
         domain_id=domain_obj.id if domain_obj else None,
         payload={
             "title": paper.title,
-            "domain": paper.domain,
+            "domains": paper.domains,
             "actor_type": actor.actor_type.value,
             "arxiv_id": paper.arxiv_id,
             "abstract_length": len(paper.abstract) if paper.abstract else 0,
@@ -395,6 +408,88 @@ async def get_paper(paper_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
 
     if not paper:
         raise HTTPException(status_code=404, detail="Paper not found")
+
+    return _paper_to_response(
+        paper,
+        paper.submitter.actor_type.value if paper.submitter else "unknown",
+        paper.submitter.name if paper.submitter else None,
+    )
+
+
+@router.patch("/{paper_id}", response_model=PaperResponse)
+async def update_paper(
+    paper_id: uuid.UUID,
+    paper_in: PaperUpdate,
+    actor: Actor = Depends(get_current_actor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a paper's metadata. Only the original submitter can update."""
+    result = await db.execute(
+        select(Paper).options(joinedload(Paper.submitter)).where(Paper.id == paper_id)
+    )
+    paper = result.scalar_one_or_none()
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    if paper.submitter_id != actor.id:
+        raise HTTPException(status_code=403, detail="Only the submitter can update this paper")
+
+    for field, value in paper_in.model_dump(exclude_none=True).items():
+        if field == "domain":
+            parts = [d.strip() for d in value.split(",") if d.strip()]
+            paper.domains = [d if d.startswith("d/") else f"d/{d}" for d in parts]
+        else:
+            setattr(paper, field, value)
+
+    await db.commit()
+    await db.refresh(paper)
+
+    return _paper_to_response(
+        paper,
+        paper.submitter.actor_type.value if paper.submitter else "unknown",
+        paper.submitter.name if paper.submitter else None,
+    )
+
+
+@router.post("/{paper_id}/upload-pdf", response_model=PaperResponse)
+async def upload_paper_pdf(
+    paper_id: uuid.UUID,
+    file: UploadFile,
+    actor: Actor = Depends(get_current_actor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload a PDF for a paper. Stores the file and generates a preview image."""
+    result = await db.execute(
+        select(Paper).options(joinedload(Paper.submitter)).where(Paper.id == paper_id)
+    )
+    paper = result.scalar_one_or_none()
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    if paper.submitter_id != actor.id:
+        raise HTTPException(status_code=403, detail="Only the submitter can upload PDFs")
+
+    pdf_bytes = await file.read()
+
+    # Store PDF
+    pdf_key = f"pdfs/{paper_id}.pdf"
+    paper.pdf_url = await storage.save(pdf_key, pdf_bytes, content_type="application/pdf")
+
+    # Generate preview from the uploaded PDF
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        png_bytes = extract_best_preview_bytes(tmp_path)
+        if png_bytes:
+            preview_key = f"previews/{uuid.uuid4().hex}.png"
+            paper.preview_image_url = await storage.save(
+                preview_key, png_bytes, content_type="image/png"
+            )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    await db.commit()
+    await db.refresh(paper)
 
     return _paper_to_response(
         paper,

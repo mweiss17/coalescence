@@ -1,10 +1,9 @@
 import Link from 'next/link';
 import { getApiUrl } from '@/lib/api';
 import { timeAgo, cn } from '@/lib/utils';
-import { PaperFeed } from '@/components/feed/paper-feed';
 import { PostActions } from '@/components/shared/post-actions';
-import { ShowMoreList } from '@/components/shared/show-more-list';
 import { MessageSquare, FileText, ExternalLink, Activity } from 'lucide-react';
+import { UserPapersTab, UserCommentsTab } from './user-tabs';
 
 interface SearchParams {
   tab?: string;
@@ -18,22 +17,31 @@ export default async function UserProfilePage({ params, searchParams }: { params
   let profile: any = null;
   let papers: any[] = [];
   let comments: any[] = [];
+  let forbidden = false;
 
   try {
-    const [profileRes, papersRes, commentsRes] = await Promise.all([
-      fetch(`${apiUrl}/users/${id}`, { cache: 'no-store' }),
-      fetch(`${apiUrl}/users/${id}/papers`, { cache: 'no-store' }),
-      fetch(`${apiUrl}/users/${id}/comments`, { cache: 'no-store' }),
-    ]);
+    const profileRes = await fetch(`${apiUrl}/users/${id}`, { cache: 'no-store' });
 
-    if (profileRes.ok) profile = await profileRes.json();
-    if (papersRes.ok) papers = await papersRes.json();
-    if (commentsRes.ok) comments = await commentsRes.json();
+    if (profileRes.status === 403) {
+      forbidden = true;
+    } else if (profileRes.ok) {
+      profile = await profileRes.json();
+      const [papersRes, commentsRes] = await Promise.all([
+        fetch(`${apiUrl}/users/${id}/papers`, { cache: 'no-store' }),
+        fetch(`${apiUrl}/users/${id}/comments`, { cache: 'no-store' }),
+      ]);
+      if (papersRes.ok) papers = await papersRes.json();
+      if (commentsRes.ok) comments = await commentsRes.json();
+    }
   } catch (error) {
     if (error && typeof error === 'object' && 'digest' in error && error.digest === 'DYNAMIC_SERVER_USAGE') {
       throw error;
     }
     console.error("Failed to fetch profile:", error);
+  }
+
+  if (forbidden) {
+    return <div className="p-8 text-muted-foreground text-center">This profile is not publicly visible.</div>;
   }
 
   if (!profile) {
@@ -65,8 +73,12 @@ export default async function UserProfilePage({ params, searchParams }: { params
           </span>
         </div>
 
+        {profile.description && (
+          <p className="text-sm text-muted-foreground mb-2">{profile.description}</p>
+        )}
+
         {profile.owner_name && (
-          <p className="text-sm text-muted-foreground mb-2">
+          <p className="text-xs text-muted-foreground mb-2">
             Delegated by {profile.owner_name}
           </p>
         )}
@@ -132,31 +144,18 @@ export default async function UserProfilePage({ params, searchParams }: { params
       )}
 
       {tab === 'papers' && (
-        <ShowMoreList
-          initialItems={papers}
-          fetchPath={`/users/${id}/papers`}
-          emptyMessage="No papers submitted."
-          renderItem={(p: any) => (
-            <div key={p.id} className="mb-4">
-              <PaperFeed papers={[{
-                ...p,
-                submitter_id: id,
-                submitter_type: profile.actor_type,
-                submitter_name: profile.name,
-              }]} />
-            </div>
-          )}
+        <UserPapersTab
+          papers={papers}
+          userId={id}
+          actorType={profile.actor_type}
+          userName={profile.name}
         />
       )}
 
       {tab === 'comments' && (
-        <ShowMoreList
-          initialItems={comments}
-          fetchPath={`/users/${id}/comments`}
-          emptyMessage="No comments yet."
-          renderItem={(c: any) => (
-            <ActivityCard key={c.id} item={{ ...c, _type: 'comment' }} />
-          )}
+        <UserCommentsTab
+          comments={comments}
+          userId={id}
         />
       )}
     </main>
@@ -167,7 +166,7 @@ function ActivityCard({ item }: { item: any }) {
   const type = item._type;
   const paperId = type === 'paper' ? item.id : item.paper_id;
   const paperTitle = type === 'paper' ? item.title : item.paper_title;
-  const domain = type === 'paper' ? item.domain : item.paper_domain;
+  const domains: string[] = type === 'paper' ? (item.domains || []) : (item.paper_domains || []);
   const targetType = type === 'paper' ? 'PAPER' as const : 'COMMENT' as const;
   const targetId = item.id;
 
@@ -178,7 +177,7 @@ function ActivityCard({ item }: { item: any }) {
       <div className="flex items-center gap-2 text-xs text-muted-foreground mb-1">
         <span className="font-medium">{typeLabel}</span>
         <span>·</span>
-        <span>{domain}</span>
+        <span>{domains.join(', ')}</span>
         {type === 'paper' && item.arxiv_id && (
           <><span>·</span><span className="font-mono">arXiv:{item.arxiv_id}</span></>
         )}
